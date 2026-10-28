@@ -273,7 +273,7 @@ import { RefusalCounter } from "./walky/refusals.ts";
 import { WalkySeen } from "./walky/seen.ts";
 import { WalkyService } from "./walky/service.ts";
 import { walkySocketPath, WalkyServer } from "./walky/socket.ts";
-import { OpencodePluginServer, pluginSocketPath, requestHistoryFromPlugin } from "./opencode-plugin/index.ts";
+import { OpencodePluginServer, PLUGIN_HISTORY_TIMEOUT_MS, pluginSocketPath } from "./opencode-plugin/index.ts";
 
 // How often the registry rescans the filesystem for sessions that appeared/disappeared after boot.
 const SESSION_REFRESH_MS = 15_000;
@@ -1989,25 +1989,13 @@ const walkyServer = new WalkyServer({
 });
 if (await walkyServer.start()) console.log(`[walky] socket at ${walkySocketPath(cfg.stateDir)}`);
 
-// Opencode plugin channel for bidirectional communication (history via plugin)
-const opencodePluginConns = new Map<string, any>();
+// Opencode plugin channel (bridge/opencode-plugin): a running opencode server answers history for
+// sessions its own database cannot — a row not written yet, a file this process cannot read. The
+// plugin dials this socket and registers itself; the History route asks it only after the journal
+// answered nothing (see `paneHistory`), so this channel can never make a readable log worse.
 const opencodePluginServer = new OpencodePluginServer({
   socketPath: pluginSocketPath(cfg.stateDir),
   stateDir: cfg.stateDir,
-  getConnection: (sessionId: string) => opencodePluginConns.get(sessionId),
-  register: (sessionId: string, paneId: string | undefined, conn: any) => {
-    opencodePluginConns.set(sessionId, conn);
-    if (paneId) conn.paneId = paneId;
-  },
-  requestHistory: async (sessionId: string, params: { after?: string; limit?: number }) => {
-    const conn = opencodePluginConns.get(sessionId);
-    if (!conn) return null;
-    try {
-      return await requestHistoryFromPlugin(conn, params);
-    } catch {
-      return null;
-    }
-  },
 });
 if (await opencodePluginServer.start()) console.log(`[opencode-plugin] socket at ${pluginSocketPath(cfg.stateDir)}`);
 const refreshTimer = setInterval(() => {
@@ -2930,6 +2918,11 @@ const server = startServer({
   activity,
   // Built above so the cache tracker probes through the same adapters this serves history from.
   journals: journals ?? undefined,
+  // The plugin channel's reader, for an opencode pane whose journal had nothing to read. The short
+  // timeout is the route's: a local plugin answers in milliseconds, and a wedged one must not hold a
+  // phone's History screen for the socket's own 30 s.
+  opencodeHistory: (sessionId, params) =>
+    opencodePluginServer.history(sessionId, params, PLUGIN_HISTORY_TIMEOUT_MS),
   cache: paneCache ?? undefined,
   todos: todos ?? undefined,
   subagents: subagents ?? undefined,

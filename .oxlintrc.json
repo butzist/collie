@@ -112,6 +112,17 @@
       }
     },
     {
+      // The opencode plugin channel is a JSON-line socket boundary in both directions. `parse.ts` decodes what a plugin wrote onto the socket and `history.ts` decodes the messages an answer carries; every `typeof` in them sits inside a field reader that turns an unvalidated line into the named value the bridge sees — the journal override's own role, one hop earlier. `plugins/opencode/` is the far end of that same socket: the repo's plugin parses Collie's lines and the opencode runtime's event and message objects.
+      "files": [
+        "**/bridge/opencode-plugin/parse.ts",
+        "**/bridge/opencode-plugin/history.ts",
+        "**/plugins/opencode/*.js"
+      ],
+      "rules": {
+        "anti-slop/no-runtime-typeof": "off"
+      }
+    },
+    {
       // Agent beacons (M11/01): a beacon is a JSON file in a state directory, written by a process Collie does not control and possibly not by Collie at all — a torn write, a newer schema, a foreign tool's file. `bridge/beacon/parse.ts` is the ONE file under bridge/beacon/ that reads an unvalidated field, exactly so this override stays a single file rather than a directory; every `typeof` in it sits inside its own field readers and IS the parse. Validation is not trust: a `path` ref that survives it is still confined by journal/files.ts (.adr/0024).
       "files": [
         "**/bridge/beacon/parse.ts"

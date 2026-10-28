@@ -141,6 +141,8 @@ import { DEFAULT_MAX_UPLOAD_BYTES } from "./uploads.ts";
 import { MAX_STT_AUDIO_BYTES } from "./stt/http.ts";
 import { computeEtag } from "./http-cache.ts";
 import { grokJournal } from "./journal/grok.ts";
+import { opencodeJournal } from "./journal/opencode.ts";
+import type { PluginHistoryReader } from "./opencode-plugin/history.ts";
 import { museJournal } from "./journal/muse.ts";
 import { TranscriptStore } from "./journal/store.ts";
 import { LiveWindows } from "./journal/live.ts";
@@ -5785,5 +5787,115 @@ describe("freeSpaceName — a folder-named space never takes a name already in u
     expect(freeSpaceName("app", [{ label: "app" }])).toBe("app-2");
     expect(freeSpaceName("app", [{ label: "app" }, { label: "app-2" }])).toBe("app-3");
     expect(freeSpaceName("app", [{ label: "app-2" }])).toBe("app");
+  });
+});
+
+// The OpenCode plugin channel is a FALLBACK source: a pane whose journal answered nothing can still
+// be answered by the running server through its plugin. These pin the two halves of that promise —
+// the fallback fires for an opencode pane the database cannot answer, and no other pane ever asks.
+describe("paneHistory — the opencode plugin answers when the journal cannot", () => {
+  const SESSION = "ses_0123456789abcdefABCDEFghij";
+
+  const pane = (agent: string, value: string): AgentView => ({
+    paneId: "w1:p1",
+    workspaceId: "w1",
+    workspaceLabel: "Main",
+    workspaceNumber: 1,
+    tabId: "w1:t1",
+    agent,
+    status: "idle",
+    cwd: "/same",
+    focused: false,
+    agentSession: { kind: "id", value },
+  });
+
+  const engineFor = (agent: AgentView): StateEngine => {
+    const stub: Partial<StateEngine> = {
+      current: () => ({ agents: [agent], shellPanes: [], workspaces: [], tabs: [], bridge: "connected" }),
+    };
+    // SAFETY: paneHistory reaches only `current()` (for the pane lookup) — the one member above,
+    // mirroring the engine stubs elsewhere in this suite.
+    return stub as StateEngine;
+  };
+
+  const mux = {
+    readGrid: async () => muxGone("no screen"),
+    foregroundProcesses: async () => muxOk([]),
+  };
+
+  const history = async (agent: AgentView, journals: Record<string, JournalAdapter>, opencodeHistory?: PluginHistoryReader) => {
+    const url = new URL(`http://x/api/pane/${agent.paneId}/history`);
+    const res = await paneHistory(
+      cfg(),
+      journals,
+      new TranscriptStore(),
+      engineFor(agent),
+      mux,
+      agent.paneId,
+      url,
+      new Request(url),
+      opencodeHistory,
+    );
+    // SAFETY: the bridge's own JSON, served by the call above.
+    return (await res.json()) as {
+      available: boolean;
+      reason?: string;
+      entries?: { role: string; parts: { kind: string; text?: string }[] }[];
+      total?: number;
+    };
+  };
+
+  test("an opencode pane the database cannot answer is served by the plugin", async () => {
+    const calls: { sessionId: string; limit?: number }[] = [];
+    const plugin: PluginHistoryReader = async (sessionId, params) => {
+      calls.push({ sessionId, ...params });
+      return {
+        entries: [
+          { id: "msg_u", type: "user", time: { created: 1_700_000_000_000 }, text: "hello from the plugin" },
+          {
+            id: "msg_a",
+            type: "assistant",
+            time: { created: 1_700_000_000_001 },
+            content: [{ type: "text", text: "and its answer" }],
+          },
+        ],
+        more: false,
+      };
+    };
+    // A root with no opencode.db: the journal resolves nothing, exactly as for a session written by
+    // a server this bridge cannot reach.
+    const journals = { opencode: opencodeJournal(["/nope/opencode-history"]) };
+    const body = await history(pane("opencode", SESSION), journals, plugin);
+    expect(body.available).toBe(true);
+    expect(body.entries?.map((entry) => entry.role)).toEqual(["user", "assistant"]);
+    expect(body.entries?.[0]?.parts[0]?.text).toBe("hello from the plugin");
+    expect(body.total).toBe(2);
+    // One wide ask; paging is the journal store's rule, applied locally.
+    expect(calls).toEqual([{ sessionId: SESSION, limit: 1000 }]);
+  });
+
+  test("another harness never asks the plugin", async () => {
+    let asked = 0;
+    const plugin: PluginHistoryReader = async () => {
+      asked += 1;
+      return { entries: [{ id: "msg_u", type: "user", text: "not yours" }], more: false };
+    };
+    const journals = { grok: grokJournal(["/nope/grok"]) };
+    const body = await history(pane("grok", "grok-session-1"), journals, plugin);
+    expect(body).toMatchObject({ available: false, reason: "no-log" });
+    expect(asked).toBe(0);
+  });
+
+  test("a plugin with nothing to say leaves the journal's own answer alone", async () => {
+    const plugin: PluginHistoryReader = async () => null;
+    const journals = { opencode: opencodeJournal(["/nope/opencode-history"]) };
+    const body = await history(pane("opencode", SESSION), journals, plugin);
+    expect(body).toMatchObject({ available: false, reason: "no-log" });
+  });
+
+  test("no plugin wired is the answer this route always gave", async () => {
+    const journals = { opencode: opencodeJournal(["/nope/opencode-history"]) };
+    const body = await history(pane("opencode", SESSION), journals);
+    expect(body).toMatchObject({ available: false, reason: "no-log" });
   });
 });

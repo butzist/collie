@@ -150,6 +150,7 @@ import { type ReleaseLine, type UpdateLineRecord, withLine } from "./update-line
 import { REPORT_SCREEN_ROWS, reportScreen, type ReportContext } from "./report.ts";
 import type { StateEngine } from "./state-engine.ts";
 import { adapterFor, buildJournalRegistry } from "./journal/registry.ts";
+import { historyPageFromPlugin, type PluginHistoryReader } from "./opencode-plugin/history.ts";
 import { readClaudeSubagent } from "./journal/claude.ts";
 import { chatParams, LiveWindows } from "./journal/live.ts";
 import { JournalSubagents } from "./subagents-journal.ts";
@@ -1253,6 +1254,15 @@ export function startServer(opts: {
    */
   journals?: Record<string, JournalAdapter>;
   /**
+   * History from a local OpenCode plugin, when the journal has nothing to read.
+   *
+   * The plugin channel (`bridge/opencode-plugin/`) is a second source for the one harness that keeps
+   * its sessions in a database: a running OpenCode server holds them in memory even when the row is
+   * not in `opencode.db` yet. Absent on every test and on any install without the plugin — the route
+   * then answers the journal's own answer, exactly as it always did.
+   */
+  opencodeHistory?: PluginHistoryReader;
+  /**
    * The prompt-cache ledger, read synchronously at serialise time exactly as `activity` is. Absent
    * means no pane carries a `cache` key — which is every test, and every install with
    * `COLLIE_TRANSCRIPT` off.
@@ -1553,6 +1563,10 @@ export function startServer(opts: {
   // the live window's numbering put back on it, so the two must share one cache or a "load older" tap
   // would re-read a 32 MB log the History view already holds.
   const live = transcripts === null ? null : new LiveWindows(transcripts);
+  // The OpenCode plugin channel's reader, when index.ts started the socket. It is a FALLBACK and
+  // only for an opencode pane: the journal is the complete renderer, the plugin answers when the
+  // database has nothing to say about a session the running server still holds.
+  const opencodeHistory = opts.opencodeHistory;
   // The agents pill's second source: Oh My Pi's and Gentle Shell's ongoing task cards, read from the
   // live windows above. Only for a pane whose journal has no subagent files (bridge/subagents-journal.ts).
   const journalSubagents = live === null || journals === null ? null : new JournalSubagents(journals, live, () => Date.now());
@@ -2183,7 +2197,7 @@ export function startServer(opts: {
 
       if (!action && req.method === "GET") return readPane(herdr, cfg, paneId, url, req);
       if (action === "history" && req.method === "GET")
-        return paneHistory(cfg, journals, transcripts, rt.engine, herdr, paneId, url, req);
+        return paneHistory(cfg, journals, transcripts, rt.engine, herdr, paneId, url, req, opencodeHistory);
       if (action === "chat" && req.method === "GET")
         return paneChat(cfg, journals, live, rt.engine, herdr, paneId, url, req, rt.send === undefined ? undefined : (pane) => rt.send!.queuedOf(rt.name, pane));
       if (action === "changes" && req.method === "GET") return paneChanges(rt.engine, paneId, url, req, homedir(), cfg.redact);
@@ -4293,6 +4307,11 @@ export async function paneHistory(
   paneId: string,
   url: URL,
   req: Request,
+  /**
+   * The OpenCode plugin channel, when one was started. A FALLBACK source, consulted only for an
+   * opencode pane whose journal answered nothing — never instead of a journal that read.
+   */
+  opencodeHistory?: PluginHistoryReader,
 ): Promise<Response> {
   const accept = req.headers.get("accept-encoding");
   const unavailable = (reason: "disabled" | "no-session" | "no-log") =>
@@ -4320,7 +4339,20 @@ export async function paneHistory(
   if (ref === null) return unavailable("no-session");
 
   try {
-    const read = await transcripts.page(adapter, ref, historyParams(url));
+    const params = historyParams(url);
+    const journal = await transcripts.page(adapter, ref, params);
+    // The plugin answers when the database cannot, and ONLY then: an opencode pane whose journal
+    // returned nothing (no row yet, a file this process cannot read) with a session id the running
+    // server may still hold in memory. `adapter.agent` is the harness that wrote the ref, not the
+    // pane's current label — a pane whose agent exited still reads through the adapter that wrote it.
+    const plugin =
+      (journal === null || journal.entries.length === 0) &&
+      opencodeHistory !== undefined &&
+      adapter.agent === "opencode" &&
+      ref.kind === "id"
+        ? await historyPageFromPlugin(opencodeHistory, ref.value, params)
+        : null;
+    const read = plugin ?? journal;
     if (read === null) return unavailable("no-log");
     // Secrets are masked here, after the store, so the cached parse stays the log's own words and a
     // `COLLIE_REDACT` change needs no cache flush (bridge/redact.ts).
