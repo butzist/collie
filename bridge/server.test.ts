@@ -5899,3 +5899,151 @@ describe("paneHistory — the opencode plugin answers when the journal cannot", 
     expect(body).toMatchObject({ available: false, reason: "no-log" });
   });
 });
+
+// The Chat route asks the same plugin the History route asks, and under the same rule: only for an
+// opencode pane whose journal answered nothing. The window numbering is the live window's, so the
+// phone's `?after=` and `?before=` tokens work without knowing which source answered.
+describe("paneChat — the opencode plugin answers when the journal cannot", () => {
+  const SESSION = "ses_0123456789abcdefABCDEFghij";
+
+  const pane = (agent: string, value: string): AgentView => ({
+    paneId: "w1:p1",
+    workspaceId: "w1",
+    workspaceLabel: "Main",
+    workspaceNumber: 1,
+    tabId: "w1:t1",
+    agent,
+    status: "idle",
+    cwd: "/same",
+    focused: false,
+    agentSession: { kind: "id", value },
+  });
+
+  const engineFor = (agent: AgentView): StateEngine => {
+    const stub: Partial<StateEngine> = {
+      current: () => ({ agents: [agent], shellPanes: [], workspaces: [], tabs: [], bridge: "connected" }),
+    };
+    // SAFETY: paneChat reaches only `current()` (for the pane lookup) on the paths read here.
+    return stub as StateEngine;
+  };
+
+  const mux = {
+    capabilities: declareCapabilities({ supports: ["paneGrid"], topologyLatency: { kind: "push" } }),
+    readGrid: async () => muxGone("no screen"),
+    foregroundProcesses: async () => muxOk([]),
+  };
+
+  const conversation = [
+    { id: "msg_u", type: "user", time: { created: 1_700_000_000_000 }, text: "hello from the plugin" },
+    {
+      id: "msg_a",
+      type: "assistant",
+      time: { created: 1_700_000_000_001 },
+      content: [{ type: "text", text: "and its answer" }],
+    },
+  ];
+
+  const chat = async (
+    agent: AgentView,
+    journals: Record<string, JournalAdapter>,
+    liveOptions: { url?: string; live?: LiveWindows; plugin?: PluginHistoryReader } = {},
+  ) => {
+    const url = new URL(liveOptions.url ?? `http://x/api/pane/${agent.paneId}/chat`);
+    const res = await paneChat(
+      cfg(),
+      journals,
+      liveOptions.live ?? new LiveWindows(new TranscriptStore()),
+      engineFor(agent),
+      mux,
+      agent.paneId,
+      url,
+      new Request(url),
+      undefined,
+      liveOptions.plugin,
+    );
+    // SAFETY: the bridge's own JSON, served by the call above.
+    return (await res.json()) as {
+      available: boolean;
+      reason?: string;
+      page?: string;
+      gen?: number;
+      rev?: number;
+      session?: string;
+      head?: number;
+      oldest?: number;
+      upserts?: { uuid: string; seq: number; role: string; parts: { kind: string; text?: string }[] }[];
+      lastPrompt?: { uuid: string; text: string };
+    };
+  };
+
+  test("an opencode pane the database cannot answer is served by the plugin", async () => {
+    const calls: { sessionId: string; limit?: number }[] = [];
+    const plugin: PluginHistoryReader = async (sessionId, params) => {
+      calls.push({ sessionId, ...params });
+      return { entries: conversation, more: false };
+    };
+    const journals = { opencode: opencodeJournal(["/nope/opencode-chat"]) };
+    const live = new LiveWindows(new TranscriptStore());
+    const body = await chat(pane("opencode", SESSION), journals, { live, plugin });
+    expect(body.available).toBe(true);
+    expect(body.page).toBe("live");
+    expect(body.upserts?.map((entry) => [entry.role, entry.parts[0]?.text])).toEqual([
+      ["user", "hello from the plugin"],
+      ["assistant", "and its answer"],
+    ]);
+    expect(body.lastPrompt).toMatchObject({ uuid: "msg_u", text: "hello from the plugin" });
+    expect(calls).toEqual([{ sessionId: SESSION, limit: 1000 }]);
+  });
+
+  test("the next poll asks with the plugin window's own token and gets an empty delta", async () => {
+    const plugin: PluginHistoryReader = async () => ({ entries: conversation, more: false });
+    const journals = { opencode: opencodeJournal(["/nope/opencode-chat"]) };
+    const live = new LiveWindows(new TranscriptStore());
+    const first = await chat(pane("opencode", SESSION), journals, { live, plugin });
+    const again = await chat(pane("opencode", SESSION), journals, {
+      live,
+      plugin,
+      url: `http://x/api/pane/w1:p1/chat?after=${first.gen}:${first.rev}`,
+    });
+    expect(again.gen).toBe(first.gen);
+    expect(again.rev).toBe(first.rev);
+    expect(again.upserts).toEqual([]);
+    expect(again.session).toBe(first.session);
+  });
+
+  test("a before page comes from the same plugin window when the journal has no older page", async () => {
+    const plugin: PluginHistoryReader = async () => ({ entries: conversation, more: false });
+    const journals = { opencode: opencodeJournal(["/nope/opencode-chat"]) };
+    const live = new LiveWindows(new TranscriptStore());
+    const first = await chat(pane("opencode", SESSION), journals, { live, plugin });
+    const cursor = first.upserts?.[1];
+    expect(cursor).toBeDefined();
+    const older = await chat(pane("opencode", SESSION), journals, {
+      live,
+      plugin,
+      url: `http://x/api/pane/w1:p1/chat?before=${cursor!.seq}:${cursor!.uuid}`,
+    });
+    expect(older.page).toBe("older");
+    expect(older.upserts?.map((entry) => entry.uuid)).toEqual(["msg_u"]);
+  });
+
+  test("another harness never asks the plugin", async () => {
+    let asked = 0;
+    const plugin: PluginHistoryReader = async () => {
+      asked += 1;
+      return { entries: conversation, more: false };
+    };
+    const journals = { grok: grokJournal(["/nope/grok"]) };
+    const body = await chat(pane("grok", "grok-session-1"), journals, { plugin });
+    expect(body).toMatchObject({ available: false, reason: "no-log" });
+    expect(asked).toBe(0);
+  });
+
+  test("a plugin with nothing to say leaves the journal's own answer alone", async () => {
+    const journals = { opencode: opencodeJournal(["/nope/opencode-chat"]) };
+    expect(
+      await chat(pane("opencode", SESSION), journals, { plugin: async () => null }),
+    ).toMatchObject({ available: false, reason: "no-log" });
+    expect(await chat(pane("opencode", SESSION), journals)).toMatchObject({ available: false, reason: "no-log" });
+  });
+});

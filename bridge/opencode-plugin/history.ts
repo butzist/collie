@@ -107,6 +107,25 @@ export function transcriptFromPlugin(entries: readonly JsonValue[]): TranscriptE
 }
 
 /**
+ * The plugin's whole answer as turns, or null when it has no speech to serve.
+ *
+ * One wide ask, the protocol's ceiling: the plugin answers forward (its newest messages), while both
+ * the History route and a Chat window page backwards. Null is the same "nothing to serve" the store
+ * answers: no live plugin for the session, an error answer, a timeout, or a session with no speech
+ * in it at all.
+ */
+export async function turnsFromPlugin(
+  read: PluginHistoryReader,
+  sessionId: string,
+): Promise<{ entries: TranscriptEntry[]; more: boolean } | null> {
+  const answer = await read(sessionId, { limit: PLUGIN_HISTORY_LIMIT });
+  if (answer === null) return null;
+  const entries = transcriptFromPlugin(answer.entries);
+  if (entries.length === 0) return null;
+  return { entries, more: answer.more };
+}
+
+/**
  * Read one page of a session's history from a plugin, or null when the channel has nothing.
  *
  * Null is the same "nothing to serve" the store answers: no live plugin for the session, an error
@@ -124,16 +143,15 @@ export async function historyPageFromPlugin(
   sessionId: string,
   page: { limit: number; before?: string },
 ): Promise<Omit<TranscriptPage, "paneId"> | null> {
-  const answer = await read(sessionId, { limit: PLUGIN_HISTORY_LIMIT });
+  const answer = await turnsFromPlugin(read, sessionId);
   if (answer === null) return null;
-  const entries = transcriptFromPlugin(answer.entries);
-  if (entries.length === 0) return null;
+  const { entries, more } = answer;
   const { window, hasMore } = pageEntries(entries, page);
   return {
     entries: window,
     // The plugin clipped older messages off its own window: when our page starts at the oldest entry
     // it returned, there is history behind it that this round trip did not carry.
-    hasMore: hasMore || (answer.more && window.length > 0 && window[0] === entries[0]),
+    hasMore: hasMore || (more && window.length > 0 && window[0] === entries[0]),
     total: entries.length,
     // Nothing was clipped off a file: the plugin answered from memory, not from a tail read.
     fileTruncated: false,

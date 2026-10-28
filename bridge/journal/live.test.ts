@@ -1174,3 +1174,166 @@ describe("redact — journal turns leave the bridge masked, shape intact", () =>
     });
   });
 });
+
+// ── The plugin's window ──────────────────────────────────────────────────────
+//
+// The OpenCode plugin is the one source that hands over whole turns instead of log rows. It must land
+// in exactly the same numbering as a journal window: a `seq` assigned once, a `rev` that moves only
+// when a turn changed, and a generation that survives a poll but not a replaced context.
+
+describe("a window fed by the OpenCode plugin", () => {
+  const turn = (uuid: string, text: string, role: TranscriptEntry["role"] = "user"): TranscriptEntry => ({
+    uuid,
+    ts: "2026-10-10T00:00:00Z",
+    role,
+    parts: [{ kind: "text", text }],
+  });
+
+  test("a first answer is a normal live window, numbered from SEQ_BASE", async () => {
+    const fx = fakeJournal();
+    const live = windows(fx);
+    const body = await live.pluginWindow(
+      fx.adapter,
+      "ses_0123456789abcdefABCDEFghij",
+      { limit: 10 },
+      [],
+      [turn("u1", "hello"), turn("a1", "hi", "assistant")],
+      false,
+    );
+    expect(body?.page).toBe("live");
+    expect(body?.upserts.map((entry) => [entry.uuid, entry.seq])).toEqual([
+      ["u1", SEQ_BASE],
+      ["a1", SEQ_BASE + 1],
+    ]);
+    expect(body?.oldest).toBe(SEQ_BASE);
+    expect(body?.head).toBe(SEQ_BASE + 1);
+    expect(body?.rev).toBe(1);
+    expect(body?.hasOlder).toBe(false);
+    expect(body?.lastPrompt).toMatchObject({ uuid: "u1", text: "hello" });
+  });
+
+  test("an unchanged poll is a delta with nothing in it, and the same positions", async () => {
+    const fx = fakeJournal();
+    const live = windows(fx);
+    const session = "ses_0123456789abcdefABCDEFghij";
+    const entries = [turn("u1", "hello"), turn("a1", "hi", "assistant")];
+    const first = await live.pluginWindow(fx.adapter, session, { limit: 10 }, [], entries, false);
+    const again = await live.pluginWindow(
+      fx.adapter,
+      session,
+      { limit: 10, after: { gen: first!.gen, rev: first!.rev } },
+      [],
+      entries,
+      false,
+    );
+    expect(again?.gen).toBe(first?.gen);
+    expect(again?.rev).toBe(first?.rev);
+    expect(again?.upserts).toEqual([]);
+  });
+
+  test("a growing reply keeps its seq and is the only upsert after its revision", async () => {
+    const fx = fakeJournal();
+    const live = windows(fx);
+    const session = "ses_0123456789abcdefABCDEFghij";
+    const first = await live.pluginWindow(
+      fx.adapter,
+      session,
+      { limit: 10 },
+      [],
+      [turn("u1", "hello"), turn("a1", "hi", "assistant")],
+      false,
+    );
+    const next = await live.pluginWindow(
+      fx.adapter,
+      session,
+      { limit: 10, after: { gen: first!.gen, rev: first!.rev } },
+      [],
+      [turn("u1", "hello"), turn("a1", "hi there", "assistant"), turn("u2", "again")],
+      false,
+    );
+    expect(next?.upserts.map((entry) => [entry.uuid, entry.seq])).toEqual([
+      ["a1", SEQ_BASE + 1],
+      ["u2", SEQ_BASE + 2],
+    ]);
+    expect(next?.head).toBe(SEQ_BASE + 2);
+  });
+
+  test("a replaced context rebuilds the generation rather than merging stale turns", async () => {
+    const fx = fakeJournal();
+    const live = windows(fx);
+    const session = "ses_0123456789abcdefABCDEFghij";
+    const first = await live.pluginWindow(
+      fx.adapter,
+      session,
+      { limit: 10 },
+      [],
+      [turn("u1", "hello"), turn("a1", "hi", "assistant")],
+      false,
+    );
+    const next = await live.pluginWindow(
+      fx.adapter,
+      session,
+      { limit: 10, after: { gen: first!.gen, rev: first!.rev } },
+      [],
+      [{ ...turn("s1", "a summary", "summary"), parts: [{ kind: "text", text: "a summary" }] }],
+      false,
+    );
+    expect(next?.gen).not.toBe(first?.gen);
+    expect(next?.upserts.map((entry) => [entry.uuid, entry.seq])).toEqual([["s1", SEQ_BASE]]);
+  });
+
+  test("a clipped answer keeps the turns this window already holds and still says older exists", async () => {
+    const fx = fakeJournal();
+    const live = windows(fx);
+    const session = "ses_0123456789abcdefABCDEFghij";
+    await live.pluginWindow(fx.adapter, session, { limit: 10 }, [], [turn("u1", "one"), turn("a1", "two", "assistant")], false);
+    const next = await live.pluginWindow(
+      fx.adapter,
+      session,
+      { limit: 10 },
+      [],
+      [turn("a1", "two", "assistant"), turn("u2", "three")],
+      true,
+    );
+    expect(next?.upserts.map((entry) => [entry.uuid, entry.seq])).toEqual([
+      ["u1", SEQ_BASE],
+      ["a1", SEQ_BASE + 1],
+      ["u2", SEQ_BASE + 2],
+    ]);
+    expect(next?.hasOlder).toBe(true);
+  });
+
+  test("a before page numbers down from the cursor, and an unknown one is null", async () => {
+    const fx = fakeJournal();
+    const live = windows(fx);
+    const session = "ses_0123456789abcdefABCDEFghij";
+    const entries = [turn("u1", "one"), turn("a1", "two", "assistant"), turn("u2", "three")];
+    const first = await live.pluginWindow(fx.adapter, session, { limit: 10 }, [], entries, false);
+    const older = live.pluginOlder(
+      fx.adapter,
+      session,
+      { limit: 10, before: { seq: SEQ_BASE + 1, uuid: "a1" } },
+      entries,
+      false,
+    );
+    expect(older?.upserts.map((entry) => [entry.uuid, entry.seq])).toEqual([["u1", SEQ_BASE]]);
+    expect(older?.hasOlder).toBe(false);
+    expect(older?.gen).toBe(first?.gen);
+    const unknown = live.pluginOlder(
+      fx.adapter,
+      session,
+      { limit: 10, before: { seq: SEQ_BASE, uuid: "gone" } },
+      entries,
+      false,
+    );
+    expect(unknown).toBeNull();
+  });
+
+  test("a plugin with no speech leaves the journal's answer alone", async () => {
+    const fx = fakeJournal();
+    const live = windows(fx);
+    expect(
+      await live.pluginWindow(fx.adapter, "ses_0123456789abcdefABCDEFghij", { limit: 10 }, [], [], false),
+    ).toBeNull();
+  });
+});

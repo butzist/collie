@@ -150,7 +150,7 @@ import { type ReleaseLine, type UpdateLineRecord, withLine } from "./update-line
 import { REPORT_SCREEN_ROWS, reportScreen, type ReportContext } from "./report.ts";
 import type { StateEngine } from "./state-engine.ts";
 import { adapterFor, buildJournalRegistry } from "./journal/registry.ts";
-import { historyPageFromPlugin, type PluginHistoryReader } from "./opencode-plugin/history.ts";
+import { historyPageFromPlugin, turnsFromPlugin, type PluginHistoryReader } from "./opencode-plugin/history.ts";
 import { readClaudeSubagent } from "./journal/claude.ts";
 import { chatParams, LiveWindows } from "./journal/live.ts";
 import { JournalSubagents } from "./subagents-journal.ts";
@@ -2199,7 +2199,7 @@ export function startServer(opts: {
       if (action === "history" && req.method === "GET")
         return paneHistory(cfg, journals, transcripts, rt.engine, herdr, paneId, url, req, opencodeHistory);
       if (action === "chat" && req.method === "GET")
-        return paneChat(cfg, journals, live, rt.engine, herdr, paneId, url, req, rt.send === undefined ? undefined : (pane) => rt.send!.queuedOf(rt.name, pane));
+        return paneChat(cfg, journals, live, rt.engine, herdr, paneId, url, req, rt.send === undefined ? undefined : (pane) => rt.send!.queuedOf(rt.name, pane), opencodeHistory);
       if (action === "changes" && req.method === "GET") return paneChanges(rt.engine, paneId, url, req, homedir(), cfg.redact);
       if (action === "files" && req.method === "GET")
         return paneFiles(rt.engine, paneId, url, req, filesPrivateFolders(cfg), homedir(), cfg.redact);
@@ -4544,6 +4544,11 @@ export async function paneChat(
   url: URL,
   req: Request,
   queuedOf?: (paneId: string) => readonly ReceiptQueued[],
+  /**
+   * The OpenCode plugin channel, when one was started. A FALLBACK source, consulted only for an
+   * opencode pane whose journal answered nothing — never instead of a journal that read.
+   */
+  opencodeHistory?: PluginHistoryReader,
 ): Promise<Response> {
   const accept = req.headers.get("accept-encoding");
   const unavailable = (reason: "disabled" | "no-session" | "no-log", detail?: "shared-folder") =>
@@ -4571,10 +4576,31 @@ export async function paneChat(
 
   const params = chatParams(url);
   try {
-    const read =
+    const receipts = queuedOf?.(paneId) ?? [];
+    const journal =
       params.before === undefined
-        ? await live.window(adapter, ref, params, queuedOf?.(paneId) ?? [])
+        ? await live.window(adapter, ref, params, receipts)
         : await live.older(adapter, ref, params.before, params.limit);
+    let read = journal;
+    // The plugin answers when the database cannot, and ONLY then — the History route's rule. For a
+    // first poll the journal must be genuinely empty (head below oldest), not merely up to date: an
+    // empty delta is a 304's body, not a reason to replace the source. For a `?before=` page an empty
+    // page is the same "the log cannot reach further back" the plugin may still answer.
+    if (
+      (read === null || chatReadIsEmpty(read)) &&
+      opencodeHistory !== undefined &&
+      adapter.agent === "opencode" &&
+      ref.kind === "id"
+    ) {
+      const plugin = await turnsFromPlugin(opencodeHistory, ref.value);
+      if (plugin !== null) {
+        if (params.before === undefined) {
+          read = await live.pluginWindow(adapter, ref.value, params, receipts, plugin.entries, plugin.more);
+        } else {
+          read = live.pluginOlder(adapter, ref.value, { ...params, before: params.before }, plugin.entries, plugin.more);
+        }
+      }
+    }
     if (read === null) return unavailable("no-log");
     // Masked before the ETag is hashed, so the tag describes what was actually sent (bridge/redact.ts).
     const body = chatBodyForMux(cfg.redact ? maskChatBody(read) : read, mux.capabilities);
@@ -4590,6 +4616,18 @@ export async function paneChat(
   } catch (err) {
     return text(`transcript read failed: ${errorText(err)}`, 502);
   }
+}
+
+/**
+ * Whether a Chat answer says the journal holds nothing at all, rather than "nothing new".
+ *
+ * A live window with no rows answers `head < oldest` (live.ts), which is the honest signal; an empty
+ * delta from a window that holds turns must never send the route to a second source. An older page
+ * with no turns is the log's own start, where the plugin may still know turns the database lacks.
+ */
+function chatReadIsEmpty(body: ChatBody): boolean {
+  if (body.page === "older") return body.upserts.length === 0;
+  return body.upserts.length === 0 && body.head < body.oldest;
 }
 
 /**

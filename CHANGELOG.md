@@ -23,6 +23,10 @@ Running a crew? Update the lead first; members follow on their own. Details:
 
 ## [Unreleased]
 
+### Fixed
+
+- **OpenCode Chat reads the plugin channel when its database has nothing.** History already fell back to the running server's plugin for a session `opencode.db` had not written yet, but Chat answered "no log" instead. It now asks the same channel and numbers those turns in the live window's own `gen`, `rev` and `seq`, so polling, "Load older" and the prompt pin work exactly as they do for a journal.
+
 ## [1.24.2] - 2026-10-28
 
 **Urgent.** A slow disk could end a send "typed, not submitted". Also fixed: slash commands under a live widget, pi on WSL, the Update tap.

@@ -245,8 +245,13 @@ function promptOf(entry: TranscriptEntry): ChatPrompt | null {
   return { uuid: entry.uuid, ts: entry.ts, ...clamp(said, LAST_PROMPT_MAX_CHARS) };
 }
 
-/** The newest prompt among these turns, walking from the tail, so the common case ends in a few. */
-function newestPrompt<T>(items: readonly T[], entryOf: (item: T) => TranscriptEntry): ChatPrompt | null {
+/**
+ * The newest prompt among these turns, walking from the tail, so the common case ends in a few.
+ *
+ * Exported because the OpenCode plugin's window (opencode-plugin/history.ts) numbers turns of its
+ * own and must name the prompt above them by the one rule the journal uses.
+ */
+export function newestPrompt<T>(items: readonly T[], entryOf: (item: T) => TranscriptEntry): ChatPrompt | null {
   for (let i = items.length - 1; i >= 0; i--) {
     const prompt = promptOf(entryOf(items[i]!));
     if (prompt !== null) return prompt;
@@ -380,7 +385,12 @@ export function chatParams(url: URL): ChatParams {
  * increasing inside a process whatever the clock does.
  */
 let lastGen = 0;
-function nextGen(): number {
+/**
+ * One numbering space for the whole process, shared with any other source that numbers turns (the
+ * OpenCode plugin's window, `opencode-plugin/history.ts`). Two counters would let a phone hold a
+ * `gen` that names one source and merge the other source's turns into it.
+ */
+export function nextGeneration(): number {
   lastGen = Math.max(Date.now(), lastGen + 1);
   return lastGen;
 }
@@ -443,7 +453,7 @@ class LiveWindow {
   /** Oldest first. The only ordering in this class; `seq` is derived from it, never the reverse. */
   private rows: LiveRow[] = [];
   private readonly byUuid = new Map<string, LiveRow>();
-  private gen = nextGen();
+  private gen = nextGeneration();
   private rev = 0;
   private nextSeq = SEQ_BASE;
   private weight = 0;
@@ -538,7 +548,7 @@ class LiveWindow {
     this.byUuid.clear();
     this.weight = 0;
     this.nextSeq = SEQ_BASE;
-    this.gen = nextGen();
+    this.gen = nextGeneration();
     this.rev = 0;
     this.trimmed = false;
     this.fromStart = fromStart;
@@ -613,6 +623,117 @@ class LiveWindow {
       this.byUuid.delete(gone.entry.uuid);
       this.trimmed = true;
     }
+  }
+
+  /**
+   * Adopt a whole window from a source that answers in TURNS rather than log rows.
+   *
+   * The OpenCode plugin is that source: it holds a running session in memory and returns its
+   * messages whole, so there is no cursor to resume and no reducer to fold — the window is rebuilt
+   * by comparing the turns it already holds with the turns just handed over. A turn whose bytes did
+   * not move keeps its `seq` and its `rev`, which is what makes an unchanged poll a 304; a turn that
+   * grew (a streaming reply) is replaced in place at the same `seq`; a new turn is appended. If a
+   * turn we hold is GONE from the answer, the source has replaced its context (compaction, a new
+   * session), and there is no honest merge: the generation is rebuilt.
+   *
+   * `more` is the plugin's own word that it clipped older messages off the window it returned. Those
+   * older turns are behind this answer, not forgotten, so the rows we already hold stay and
+   * `hasOlder` keeps saying so.
+   */
+  adopt(entries: readonly TranscriptEntry[], more: boolean): void {
+    const incoming = entries.filter((entry) => entry.uuid !== "");
+    if (incoming.length === 0) return;
+    const incomingIds = new Set(incoming.map((entry) => entry.uuid));
+    const first = incoming[0]!;
+    const firstHeld = this.rows.findIndex((row) => row.entry.uuid === first.uuid);
+    // A plugin that clipped its own tail below what this window holds: keep the rows in front of it.
+    // They are simply older than the window the answer came from.
+    const kept = firstHeld > 0 && more ? this.rows.slice(0, firstHeld) : [];
+    const keptIds = new Set(kept.map((row) => row.entry.uuid));
+    let rebuild = firstHeld < 0;
+    if (!rebuild) {
+      // Any held turn the answer neither kept nor names is one the source replaced or compacted away.
+      for (const row of this.rows) {
+        if (keptIds.has(row.entry.uuid)) continue;
+        if (!incomingIds.has(row.entry.uuid)) {
+          rebuild = true;
+          break;
+        }
+      }
+    }
+    if (!rebuild) {
+      // The turns we hold must still be in the source's order; a reordered thread is a new numbering.
+      const held = incoming.filter((entry) => this.byUuid.has(entry.uuid)).map((entry) => entry.uuid);
+      const ours = this.rows.filter((row) => !keptIds.has(row.entry.uuid)).map((row) => row.entry.uuid);
+      if (held.length !== ours.length || held.some((uuid, i) => uuid !== ours[i])) rebuild = true;
+    }
+    if (!rebuild) {
+      // A turn we do not hold is new, and new turns only ever arrive after the ones already here. An
+      // answer that inserts one in the middle is a replaced thread, not an append.
+      const firstNew = incoming.findIndex((entry) => !this.byUuid.has(entry.uuid));
+      if (firstNew >= 0 && incoming.slice(firstNew + 1).some((entry) => this.byUuid.has(entry.uuid))) {
+        rebuild = true;
+      }
+    }
+    // `fromStart` is the one bit that says whether older turns exist behind this window: the plugin
+    // clipped (`more`) or it did not. Trimmed rows are tracked separately, because a later answer
+    // cannot un-drop what this window's own bounds dropped.
+    this.fromStart = !more;
+    if (rebuild) this.rebuild(!more);
+    this.foldTurns(rebuild ? incoming : [...kept.map((row) => row.entry), ...incoming]);
+    this.trim();
+  }
+
+  /**
+   * Fold whole turns in, the way {@link fold} folds rows: one revision per tick that moved anything.
+   * A turn already held keeps its `seq` whatever changed inside it, exactly as a re-emitted row does.
+   */
+  private foldTurns(entries: readonly TranscriptEntry[]): void {
+    if (entries.length === 0) return;
+    const rev = this.rev + 1;
+    let moved = false;
+    for (const entry of entries) {
+      const json = JSON.stringify(entry);
+      const weight = json.length;
+      const held = this.byUuid.get(entry.uuid);
+      if (held !== undefined) {
+        if (held.weight === weight && JSON.stringify(held.entry) === json) continue;
+        held.entry = entry;
+        this.weight += weight - held.weight;
+        held.weight = weight;
+        held.rev = rev;
+        moved = true;
+        continue;
+      }
+      const row: LiveRow = { seq: this.nextSeq++, rev, weight, entry };
+      this.rows.push(row);
+      this.byUuid.set(entry.uuid, row);
+      this.weight += weight;
+      moved = true;
+    }
+    if (moved) this.rev = rev;
+  }
+
+  /**
+   * A `?before=` page from the turns this window holds. The plugin source has no disk behind it, so
+   * the same window is the only place older turns can come from; a cursor this window does not hold
+   * (a bridge restart, or a turn its bounds dropped) answers null and the route keeps the journal's
+   * own answer.
+   */
+  olderFrom(before: ChatBefore, limit: number): ChatOlderBody | null {
+    const at = this.rows.findIndex((row) => row.entry.uuid === before.uuid);
+    if (at <= 0) return null;
+    const start = Math.max(0, at - limit);
+    const page = this.rows.slice(start, at);
+    if (page.length === 0) return null;
+    const first = before.seq - page.length;
+    return {
+      page: "older",
+      gen: this.gen,
+      session: this.session,
+      upserts: page.map((row, i) => chatEntry(row.entry, first + i)),
+      hasOlder: start > 0 || this.trimmed || !this.fromStart,
+    };
   }
 
   /**
@@ -717,6 +838,14 @@ export interface HeldWindow {
 const MAX_WINDOW_REFS = 4;
 
 /**
+ * The key a plugin window is held under. Namespaced, because the same session id may also have a
+ * journal window (`<db>#<sessionId>`), and the two numberings must never be one window.
+ */
+function pluginWindowKey(sessionId: string): string {
+  return `opencode-plugin:${sessionId}`;
+}
+
+/**
  * Every live session this bridge is holding, one window each.
  *
  * Keyed by the RESOLVED key — the path a file harness's log sits at, or the database-plus-session key
@@ -813,6 +942,45 @@ export class LiveWindows {
       upserts: page.entries.map((entry, i) => chatEntry(entry, first + i)),
       hasOlder: page.hasMore,
     };
+  }
+
+  /**
+   * What is new in this pane's session, from the OpenCode plugin rather than the journal.
+   *
+   * The plugin is a FALLBACK source (`bridge/opencode-plugin/`): the route asks it only when the
+   * journal answered nothing for an opencode pane. It returns whole turns, so the window adopts them
+   * (`LiveWindow.adopt`) and answers exactly as a journal window does — same `gen`/`rev`/`seq`
+   * numbering, same `?after=` delta, same prompt and queued-send fields. Null when the plugin had no
+   * speech to offer, which leaves the journal's own answer in place.
+   */
+  async pluginWindow(
+    adapter: JournalAdapter,
+    sessionId: string,
+    params: ChatParams,
+    receipts: readonly ReceiptQueued[],
+    entries: readonly TranscriptEntry[],
+    more: boolean,
+  ): Promise<ChatWindowBody | null> {
+    if (entries.length === 0) return null;
+    const window = this.reach(pluginWindowKey(sessionId), adapter);
+    window.adopt(entries, more);
+    return window.body(params.after ?? null, params.limit, receipts);
+  }
+
+  /**
+   * The turns immediately before one the client holds, from the plugin window's own memory. Null
+   * when this window never held that turn, so the route can keep the journal's answer.
+   */
+  pluginOlder(
+    adapter: JournalAdapter,
+    sessionId: string,
+    params: ChatParams & { before: ChatBefore },
+    entries: readonly TranscriptEntry[],
+    more: boolean,
+  ): ChatOlderBody | null {
+    const window = this.reach(pluginWindowKey(sessionId), adapter);
+    if (entries.length > 0) window.adopt(entries, more);
+    return window.olderFrom(params.before, params.limit);
   }
 
   /**
